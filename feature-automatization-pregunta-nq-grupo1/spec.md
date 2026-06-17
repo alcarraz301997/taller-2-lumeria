@@ -2,7 +2,7 @@
 
 ## Resumen ejecutivo
 
-Se implementará un flujo automatizado de reabastecimiento del banco de preguntas de Lumeria mediante integración con NQ. Actualmente, cuando durante la generación de material académico no existen suficientes preguntas disponibles, el sistema registra preguntas faltantes asociadas a tema, subtema y nivel. Sin embargo, dichos registros solo cumplen una función de trazabilidad y no activan procesos de reposición. La nueva funcionalidad utilizará estos registros como insumo para generar solicitudes automáticas en segundo plano hacia NQ, permitiendo generar nuevas preguntas e incorporarlas al banco IA de forma automática. Esto garantizará una mayor disponibilidad de contenido, reducirá la intervención manual y mejorará la capacidad de respuesta ante futuras solicitudes de generación.
+Se implementará un flujo automatizado de reabastecimiento del banco de preguntas de Lumeria mediante integración con NQ. Actualmente, cuando durante la generación de material académico no existen suficientes preguntas disponibles, el sistema registra preguntas faltantes asociadas a tema, subtema y nivel. Sin embargo, dichos registros solo cumplen una función de trazabilidad y no activan procesos de reposición. La nueva funcionalidad utilizará estos registros como insumo para generar solicitudes automáticas en segundo plano hacia NQ, permitiendo generar nuevas preguntas e incorporarlas al banco de forma automática. Esto garantizará una mayor disponibilidad de contenido, reducirá la intervención manual y mejorará la capacidad de respuesta ante futuras solicitudes de generación.
 
 ---
 
@@ -24,33 +24,115 @@ La automatización permitirá mantener un banco constantemente abastecido, reduc
 
 ## US-1 (P1)
 
-**Como** sistema de generación de materiales,
-**quiero** procesar automáticamente los registros de preguntas faltantes,
-**para** reabastecer el banco de preguntas mediante integración con NQ.
+# HU-A: Orquestar envío automático de preguntas faltantes hacia NQ
 
-### AC-1.1 Registro estructurado de faltantes
+## Contexto
 
-**Dado** que durante la generación de material no existen suficientes preguntas disponibles para completar la solicitud,
+Actualmente Lumeria registra preguntas faltantes durante el proceso de generación de materiales académicos. Sin embargo, el abastecimiento de estas preguntas requiere intervención manual de docentes mediante el flujo tradicional de generación en NQ, generando retrasos operativos y dependencia manual para iniciar la generación.
 
-**Cuando** el sistema detecta la ausencia de preguntas requeridas,
+Se requiere automatizar el envío de estos faltantes hacia NQ reutilizando la integración backend existente para iniciar automáticamente el proceso de generación de preguntas.
 
-**Entonces** debe registrar obligatoriamente un faltante almacenando tema, subtema y nivel asociado como estructura de reposición pendiente.
+---
 
-### AC-1.2 Procesamiento automático en segundo plano
+## Valor
 
-**Dado** que existe un registro de faltante pendiente generado por el sistema,
+Reduce el tiempo de abastecimiento de preguntas faltantes eliminando la intervención manual inicial y permitiendo iniciar automáticamente la generación de nuevas preguntas desde el backlog de faltantes.
 
-**Cuando** el proceso automático de sincronización identifica dicho registro,
+---
 
-**Entonces** debe enviar una solicitud automática hacia NQ incluyendo como payload el tema, subtema y nivel correspondiente al faltante registrado.
+## Descripción
 
-### AC-1.3 Reabastecimiento automático del banco
+El sistema debe identificar automáticamente los registros de preguntas faltantes pendientes, organizarlos por prioridad temporal y enviarlos automáticamente hacia NQ utilizando la integración backend existente.
 
-**Dado** que NQ responde exitosamente con preguntas generadas,
+Cada solicitud deberá enviarse en bloques de hasta 5 preguntas respetando el flujo actual de generación definido por NQ y procesando los registros bajo una cola FIFO basada en la fecha de generación del material original.
 
-**Cuando** el sistema recibe la respuesta de generación,
+---
 
-**Entonces** debe insertar automáticamente las nuevas preguntas dentro del banco validando integridad estructural y evitando duplicidad de contenido.
+## Rol
+
+Administrador
+
+---
+
+## Alcance
+
+* Registro de preguntas faltantes existentes en Lumeria
+* Integración backend API con NQ
+* Envío automático de solicitudes de generación
+* Procesamiento FIFO de registros pendientes
+
+---
+
+## Criterios de Aceptación
+
+### 1. Ejecución automática del envío
+
+**WHEN** existan registros de preguntas faltantes pendientes de procesamiento
+**THE SYSTEM SHALL** iniciar automáticamente el proceso de envío hacia NQ sin requerir intervención manual.
+
+---
+
+### 2. Procesamiento por orden de prioridad
+
+**WHEN** existan múltiples registros pendientes de envío
+**THE SYSTEM SHALL** procesarlos en orden cronológico desde el material más antiguo al más reciente.
+
+---
+
+### 3. Regla de cola FIFO
+
+**WHILE** existan múltiples materiales pendientes de procesamiento
+**THE SYSTEM SHALL** mantener una cola FIFO utilizando como referencia la fecha de generación del material asociado al faltante.
+
+---
+
+### 4. Validación de cursos habilitados
+
+**WHEN** el sistema prepare información para enviar a NQ
+**THE SYSTEM SHALL** enviar únicamente registros pertenecientes a cursos habilitados para esta integración.
+
+Cursos habilitados iniciales:
+
+* Álgebra
+* Aritmética
+* Trigonometría
+* Química
+
+---
+
+### 5. Validación de atributos enviados
+
+**WHEN** se genere una solicitud hacia NQ
+**THE SYSTEM SHALL** enviar únicamente los atributos requeridos por la API de integración.
+
+Atributos enviados:
+
+* Curso
+* Tema
+* Subtema
+* Nivel
+
+---
+
+### 6. División por bloques
+
+**WHEN** un registro de faltante requiera generación de múltiples preguntas
+**THE SYSTEM SHALL** dividir automáticamente la solicitud en bloques máximos de 5 preguntas por envío respetando la restricción operativa actual de NQ.
+
+---
+
+### 7. Consumo de API existente
+
+**WHEN** el sistema ejecute un envío automático
+**THE SYSTEM SHALL** utilizar la API backend actualmente disponible en NQ sin modificar el flujo interno de generación existente.
+
+---
+
+### 8. Manejo de error de integración
+
+**IF** la API de NQ no responde correctamente
+**THEN THE SYSTEM SHALL** registrar el intento fallido y mantener el registro en estado pendiente para su posterior reprocesamiento.
+
 
 ---
 
