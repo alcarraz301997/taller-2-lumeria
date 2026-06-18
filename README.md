@@ -61,28 +61,38 @@ Los detalles funcionales se encuentran documentados en:
 
 ## Grupo revisor
 
-Pendiente
+Equipo L2
 
 ## Checklist
 
-| Categoría    | Resultado |
-| ------------ | --------- |
-| Completitud  | ✅ |
-| Claridad     | ✅ |
-| Consistencia | ✅ |
-| Testabilidad | ✅ |
+| Categoría    | Resultado | Observación breve |
+| ------------ | --------- | ----------------- |
+| Completitud  | ⚠️ Parcial | Faltan NFR cuantitativos (latencia, RPS), manejo HTTP 429, timeouts y Redis indisponible.
+| Claridad     | ⚠️ Parcial | Ambigüedades en trigger (inmediato vs batch), y en la cantidad a solicitar por faltante.
+| Consistencia | ⚠️ Parcial | Mezcla de idioma (constitución: inglés técnicos; spec: español). "3 ciclos" aparece en TCs; falta en spec.
+| Testabilidad | ✅ Parcial | TCs detallados; faltan cargas/429/timeouts/Redis.
 
-## Observaciones
+## Hallazgos clave
 
-Tres artefactos alineados tras grilling cruzado. 14 roturas detectadas y mitigadas. Spec NEEDS_CLARIFICATION resuelto. Plan actualizado con reposition_cycles, timestamp conservado y flujo FAILED.
+- Las US y TCs son mayoritariamente medibles (DB counts, estados, invocaciones).  
+- Falta especificar NFRs numéricos (ej. SLA/latencia, RPS, contención por worker).  
+- Faltan TCs para HTTP 429, connection/read timeouts y ausencia de Redis.  
+- Ambigüedad crítica: ¿el envío se ejecuta inmediatamente al registrar el faltante o por batch programado?  
+- Consistencia: unificar convención para identificadores técnicos (course_id, estados, nombres en código).
 
-## Veredicto
+## Acciones recomendadas (prioridad alta → baja)
 
-⬜ 🟢 Aprobado
+1. Añadir en spec.md: NFR cuantitativos (latencia objetivo por operación / throughput), y política para HTTP 429 y timeouts. (Alta)
+2. Incorporar en spec.md la regla "máximo 3 ciclos de reposición" (HU-2) para evitar ambigüedad. (Alta)
+3. Añadir TCs para HTTP 429, connection/read timeout y Redis indisponible; incluir test de carga/volumen. (Alta)
+4. Decidir convención de idioma para términos técnicos y propagarlas a constitution.md y spec.md. (Media)
+5. Definir trigger de envío (inmediato vs batch) y consolidación de faltantes (si aplica). (Bloqueante para diseño)
 
-✅ 🟡 Aprobado con observaciones
+## Preguntas abiertas (necesitan respuesta del PO)
 
-⬜ 🔴 Requiere correcciones
+1. ¿Cuántas preguntas debe solicitar el sistema a NQ por cada faltante? (Ej: solicitar la cantidad faltante, dividida en bloques ≤5 — recomendado).  
+2. ¿Consolidar registros repetidos antes de enviar o procesarlos individualmente?  
+3. ¿Enviar inmediatamente al crearse el faltante o procesar por batch programado?
 
 ---
 
