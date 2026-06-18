@@ -2,33 +2,39 @@
 
 ## Resumen ejecutivo
 
-La solución propone automatizar el reabastecimiento del banco de preguntas de Lumeria utilizando los registros de preguntas faltantes generados durante la creación de materiales académicos. Cuando el sistema detecte que no existen suficientes preguntas para completar una generación, registrará un faltante asociado a curso, tema, subtema y nivel. Un proceso asíncrono identificará estos registros pendientes y enviará solicitudes automáticas a NQ para generar nuevas preguntas. Las respuestas recibidas serán validadas utilizando la lógica existente de control de duplicidad y únicamente las preguntas válidas serán almacenadas en la tabla temporal de revisión docente. La solución incorpora procesamiento FIFO, control de estados, manejo de errores, reintentos automáticos y trazabilidad completa para minimizar intervención manual y garantizar continuidad operativa.
+La solución propone automatizar el reabastecimiento del banco de preguntas de Lumeria utilizando los registros de preguntas faltantes generados durante la creación de materiales académicos. Cuando el sistema detecte que no existen suficientes preguntas para completar una generación, registrará un faltante asociado a curso, tema, subtema y nivel. Un worker secuencial identificará estos registros pendientes y enviará solicitudes automáticas a NQ para generar nuevas preguntas. Las respuestas recibidas serán validadas utilizando la lógica existente de control de duplicidad y únicamente las preguntas válidas serán almacenadas en la tabla temporal de revisión docente, todo dentro de una misma transacción. La solución incorpora procesamiento FIFO, control de estados (incluyendo `CANCELLED`), manejo de errores con distinción 4xx vs 5xx, reintentos automáticos (máximo 3, estándar del proyecto), trazabilidad completa y monitoreo vía Horizon para minimizar intervención manual y garantizar continuidad operativa.
 
 ---
 
 # 1. Enfoque técnico (alto nivel)
 
-La solución utilizará un modelo de procesamiento asíncrono basado en colas de trabajo.
+La solución utilizará un modelo de procesamiento asíncrono basado en colas de trabajo con workers secuenciales (1 registro a la vez).
 
-Durante la generación de materiales académicos, cuando no existan suficientes preguntas para completar la solicitud, el sistema registrará un faltante asociado a curso, tema, subtema y nivel.
-
-Los faltantes serán acumulativos para una misma combinación de curso, tema, subtema y nivel. Cuando se consoliden múltiples registros idénticos, la solicitud agrupada hereda el timestamp más antiguo del grupo para mantener la prioridad FIFO.
+Durante la generación de materiales académicos, cuando no existan suficientes preguntas para completar la solicitud, el sistema registrará un faltante asociado a curso, tema, subtema y nivel. **Cada generación crea su propio registro separado**, no se acumulan.
 
 Los registros pendientes serán procesados automáticamente mediante una cola FIFO estricta utilizando la fecha de generación del material como criterio de prioridad.
 
-Antes de enviar una solicitud a NQ, el sistema validará que el curso se encuentre habilitado para la integración y dividirá la solicitud en bloques de hasta 5 preguntas según las restricciones de la API de NQ.
+Antes de enviar una solicitud a NQ, el sistema validará que el curso se encuentre habilitado para la integración:
+- **Curso deshabilitado en Lumeria** (curso, tema, subtema o nivel eliminado): se eliminan los registros `PENDING` asociados.
+- **Curso deshabilitado en NQ**: el registro transita a `CANCELLED` sin enviarse a la cola.
+
+Si el curso está habilitado, se dividirá la solicitud en bloques de hasta 5 preguntas según las restricciones de la API de NQ. Entre cada request a NQ se aplica un **delay fijo configurable** para evitar saturación.
 
 Las preguntas recibidas serán sometidas al flujo existente de validación de duplicidad. Las preguntas válidas serán almacenadas en la tabla temporal de revisión docente y las preguntas descartadas generarán automáticamente nuevas solicitudes hasta completar la cantidad originalmente requerida, con un máximo de 3 ciclos de reposición. Si tras 3 ciclos no se alcanza la cantidad requerida, el faltante transitará a `FAILED` con motivo `max_reposition_cycles_exceeded`.
 
-Si durante un ciclo de reposición ocurre un error de NQ (HTTP 5xx, timeout), el contador `reposition_cycles` se incrementa igualmente — el ciclo fallido cuenta contra el límite de 3. Esto evita ciclos de reposición infinitos cuando NQ está degradado.
+**Tanto el almacenamiento de preguntas como la actualización del faltante ocurren en una misma transacción** para evitar duplicados por crash del worker.
 
-Si un registro vuelve a `PENDING` por error de NQ (HTTP 5xx, timeout), conservará su timestamp original de generación para mantener la prioridad FIFO.
+Manejo de errores HTTP:
+- **5xx / timeout**: reintentos con backoff, máximo 3 (estándar del proyecto). Si se agotan, el registro vuelve a `PENDING` conservando su timestamp original. Un worker posterior reintentará desde el bloque donde falló.
+- **4xx (bad request)**: `FAILED` inmediato sin reintento, registrado en logs para monitoreo vía Horizon.
 
-Por cada ciclo de procesamiento, el sistema ejecutará un máximo de 3 reintentos ante error NQ. Si los 3 fallan, el registro vuelve a `PENDING`. El siguiente ciclo comenzará con reintentos frescos.
+Si un registro vuelve a `PENDING` por error de NQ (HTTP 5xx, timeout), conservará su timestamp original de generación para mantener la prioridad FIFO. Si un registro supera el tope de 3 reintentos sin éxito, transita a `FAILED` con motivo `max_retries_exceeded`.
 
-Si la respuesta de NQ es exitosa pero la inserción en BD falla, la respuesta se persiste en Redis (TTL 24h) asociada al `faltante_id`. En el reintento, el sistema reusa la respuesta cacheada en lugar de solicitar nuevas preguntas a NQ, evitando doble consumo de créditos.
+Un registro `FAILED` podrá re-procesarse automáticamente si la causa se resuelve (ej. curso se re-habilita). Esto se evalúa en la siguiente consulta de faltantes para envío a cola; no hay reproceso inmediato.
 
-Finalmente, el sistema registrará el resultado del proceso para garantizar trazabilidad y monitoreo.
+El criterio de `COMPLETED` es `generated_quantity >= requested_quantity`.
+
+Finalmente, el sistema registrará el resultado del proceso en logs. El monitoreo operativo se realiza vía Horizon.
 
 ### Flujo general
 
@@ -36,40 +42,40 @@ Finalmente, el sistema registrará el resultado del proceso para garantizar traz
 Generación de material
         ↓
 Registro de faltante (PENDING)
+(cada generación = registro separado)
         ↓
 Cola FIFO (ordenado por fecha generación)
         ↓
-Worker asíncrono
+Worker secuencial (1 registro a la vez)
         ↓
 Validación de curso habilitado
-   ↓ No                ↓ Sí
-FAILED              Continuar
-(no habilitado)         ↓
-                División en bloques (máx. 5)
-                        ↓
-                Integración con NQ
-                   ↓ OK           ↓ Error (5xx/timeout)
-                Recepción      Reintentos (backoff)
-                    ↓               ↓
-                Validación     Agotados → PENDING
-                duplicidad     (conserva timestamp)
-                    ↓
-                 ¿Cantidad requerida completada?
-                       ↓ No                  ↓ Sí
-                 ¿Ciclos < 3?           COMPLETED
-               ↓ Sí          ↓ No
-          Reprocesar       FAILED
-          (PARTIAL →   (max_reposition
-           PROCESSING)   _cycles_exceeded)
-                ↓
-          ¿Error NQ?
-        ↓ Sí           ↓ No
-    reposition_cycles  Insertar OK
-    +1, vuelve a          ↓
-    PENDING (backoff)  COMPLETED
+   ↓ No (en Lumeria)    ↓ No (en NQ)          ↓ Sí
+  Eliminar PENDING     CANCELLED           Continuar
+  asociados                                     ↓
+                                        División en bloques (máx. 5)
+                                        (delay fijo configurable entre requests)
+                                                ↓
+                                        Integración con NQ
+                                     ↓ OK                 ↓ Error
+                                  Recepción        ┌─────────┬─────────┐
+                                      ↓          5xx/timeout    4xx
+                                  Validación      reintentos    FAILED
+                                  duplicidad     (máx 3)          ↓
+                                      ↓        ┌────┴────┐    (logs)
+                                  Transacción  OK    Agotados
+                                  única (pregs  ↓        ↓
+                                  + faltante)  sigo  PENDING
+                                      ↓        (cons. timestamp)
+                                  ¿generated >= requested?
+                                      ↓ No                ↓ Sí
+                                  ¿Ciclos < 3?       COMPLETED
+                                ↓ Sí          ↓ No
+                            Solicitar        FAILED
+                            reposición    (max_reposition
+                                ↓         _cycles_exceeded)
+                            Actualizar
+                            (PARTIAL)
 ```
-
-> **Recuperación de stale jobs:** Un scheduled command `faltantes:recover-stale` ejecutado cada 5 minutos detecta faltantes en estado `PROCESSING` con `updated_at > 30 minutos` y los devuelve a `PENDING`. Esto cubre el escenario de worker crash durante el procesamiento.
 
 ---
 
@@ -81,15 +87,16 @@ Componente encargado de almacenar los faltantes detectados durante la generació
 
 Mantiene la trazabilidad completa del proceso mediante estados de procesamiento y control de cantidades generadas.
 
-Estados sugeridos:
+Estados:
 
 * PENDING
 * PROCESSING
 * PARTIAL
 * COMPLETED
 * FAILED
+* **CANCELLED** (curso deshabilitado en NQ)
 
-Información sugerida:
+Información:
 
 * requested_quantity
 * generated_quantity
@@ -97,6 +104,7 @@ Información sugerida:
 * processed_at
 * retry_count
 * reposition_cycles
+* failure_reason (course_disabled_in_nq, max_reposition_cycles_exceeded, max_retries_exceeded, bad_request)
 
 ### Control de reposición
 
@@ -108,15 +116,19 @@ Permite determinar cuándo un faltante ha sido satisfecho completamente y evita 
 
 Administra la ejecución automática de registros pendientes respetando el orden cronológico de generación.
 
+Workers secuenciales: procesan 1 registro a la vez, eliminando la necesidad de locks distribuidos.
+
 ### Integración con NQ
 
 Gestiona la comunicación con el servicio externo para solicitar generación de preguntas.
 
 Responsabilidades:
 
-* Validar cursos habilitados.
+* Validar cursos habilitados (Lumeria y NQ).
+* Diferenciar deshabilitado en Lumeria (eliminar PENDING) vs en NQ (CANCELLED).
 * Dividir solicitudes en bloques máximos de 5 preguntas.
-* Gestionar reintentos automáticos.
+* Aplicar delay fijo configurable entre requests.
+* Gestionar reintentos automáticos (máx 3 para 5xx/timeout; 4xx → FAILED directo).
 * Solicitar reposiciones cuando existan preguntas descartadas por duplicidad.
 
 ### Validador de duplicidad
@@ -129,11 +141,7 @@ Almacena únicamente las preguntas válidas generadas por NQ para continuar con 
 
 ### Auditoría y monitoreo
 
-Registra eventos relevantes para seguimiento operativo, diagnóstico de errores y análisis de desempeño.
-
-### Stale Job Recovery (Scheduled Command)
-
-Comando programado `faltantes:recover-stale` ejecutado cada 5 minutos. Detecta faltantes en estado `PROCESSING` con `updated_at > 30 minutos` y los devuelve a `PENDING`, permitiendo que el worker los retome. Cada recuperación queda registrada en auditoría con `action = 'stale_recovery'`.
+Registra eventos relevantes para seguimiento operativo, diagnóstico de errores y análisis de desempeño. Monitoreo vía Horizon.
 
 ---
 
@@ -141,11 +149,11 @@ Comando programado `faltantes:recover-stale` ejecutado cada 5 minutos. Detecta f
 
 ## Decisión
 
-Utilizar procesamiento asíncrono mediante colas FIFO para ejecutar automáticamente la integración con NQ.
+Utilizar procesamiento asíncrono mediante colas FIFO con workers secuenciales para ejecutar automáticamente la integración con NQ.
 
 ## Justificación
 
-La generación de preguntas depende de un servicio externo y puede presentar tiempos de respuesta variables. El uso de colas permite desacoplar el proceso de generación de materiales, priorizar registros pendientes y soportar múltiples solicitudes sin afectar la experiencia de usuario.
+La generación de preguntas depende de un servicio externo y puede presentar tiempos de respuesta variables. El uso de colas permite desacoplar el proceso de generación de materiales, priorizar registros pendientes y soportar múltiples solicitudes sin afectar la experiencia de usuario. Workers secuenciales eliminan la necesidad de locks distribuidos y simplifican la consistencia.
 
 ## Alternativa descartada
 
@@ -161,23 +169,27 @@ Incrementaría el tiempo de respuesta de la generación de materiales y afectar�
 
 | Riesgo                                      | Mitigación                          |
 | ------------------------------------------- | ----------------------------------- |
-| API de NQ no disponible                     | Reintentos automáticos (máx 3/ciclo) |
-| Respuesta inválida de NQ                    | Validación previa al almacenamiento |
-| Preguntas duplicadas                        | Validación automática y reposición  |
-| Procesamiento simultáneo del mismo faltante | Control de estados                  |
-| Alto volumen de faltantes pendientes        | Cola FIFO                           |
-| Cursos no habilitados                       | Validación previa                   |
+| API de NQ no disponible                     | Reintentos automáticos (máx 3, luego FAILED) |
+| Respuesta inválida de NQ (4xx)              | FAILED inmediato sin reintento      |
+| Preguntas duplicadas                        | Validación automática y reposición (máx 3 ciclos) |
+| Procesamiento simultáneo del mismo faltante | Workers secuenciales (1 registro a la vez) |
+| Crash del worker tras recibir preguntas     | Transacción única (preguntas + faltante) |
+| Alto volumen de faltantes pendientes        | Cola FIFO + workers secuenciales    |
+| Cursos no habilitados                       | Validación previa: eliminar PENDING (Lumeria) o CANCELLED (NQ) |
 | Reposición incompleta                       | Máximo 3 ciclos de reposición, luego FAILED |
-| Worker muere en PROCESSING (stale job)      | Scheduled command `faltantes:recover-stale` (cada 5 min, timeout 30 min) |
-| Doble consumo de créditos NQ por fallo BD   | Cache de respuesta NQ en Redis (TTL 24h) |
+| Inanición FIFO por reintentos infinitos     | Tope de 3 reintentos por error 5xx/timeout |
+| Rate limiting de NQ                         | Delay fijo configurable entre requests |
+| Registros FAILED sin supervisión            | Monitoreo vía Horizon (logs)        |
+| Reproceso de FAILED no controlado           | Solo en siguiente consulta a cola si causa se resuelve |
 
 ### Dependencias
 
 * Disponibilidad de la API NQ.
 * Existencia de registros válidos de faltantes.
 * Disponibilidad del mecanismo de procesamiento asíncrono.
-* Disponibilidad de la tabla temporal de revisión docente.
+* Disponibilidad de la tabla temporal de revisión docente (misma BD que faltantes).
 * La API NQ limita las solicitudes a un máximo de 5 preguntas por petición.
+* La lógica de validación de duplicidad existente es reutilizable.
 
 ---
 
@@ -192,8 +204,9 @@ Incrementaría el tiempo de respuesta de la generación de materiales y afectar�
 | HU-2 Reposición automática      | Control de reposición            |
 | HU-2 Almacenamiento temporal    | Tabla temporal de revisión       |
 | NFR-1 Procesamiento asíncrono   | Gestor FIFO                      |
-| NFR-2 Evitar duplicados         | Validador de duplicidad          |
-| NFR-3 Procesamiento concurrente | Gestor FIFO y control de estados |
+| NFR-2 Evitar duplicados         | Validador de duplicidad + transacción única |
+| NFR-3 Procesamiento secuencial  | Workers secuenciales             |
+| NFR-4 Monitoreo operativo       | Horizon + logs                   |
 
 ---
 
@@ -202,5 +215,8 @@ Incrementaría el tiempo de respuesta de la generación de materiales y afectar�
 * NQ generará preguntas respetando el curso, tema, subtema y nivel enviados en la solicitud.
 * Los registros de faltantes mantienen información académica suficiente para construir el payload hacia NQ.
 * La validación de duplicidad existente en Lumeria puede reutilizarse sin modificaciones significativas.
+* La tabla temporal de revisión docente y la tabla de faltantes están en la misma base de datos (soporta transacciones únicas).
+* El volumen de faltantes permite workers secuenciales sin impacto operativo significativo.
+* El delay fijo configurable entre requests a NQ es suficiente para evitar rate limiting.
 
 ---
